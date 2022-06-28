@@ -89,6 +89,8 @@ class QiskitBackend(QuantumBackend):
         self.basis_gates = kwargs.get(
             "basis_gates", self.device.configuration().basis_gates
         )
+        self.init_layout = kwargs.get("init_layout", None)
+        self.seed_transpiler = kwargs.get("seed_transpiler", None)
         self.retry_delay_seconds = retry_delay_seconds
         self.retry_timeout_seconds = retry_timeout_seconds
         self.n_samples_for_readout_calibration = n_samples_for_readout_calibration
@@ -268,6 +270,8 @@ class QiskitBackend(QuantumBackend):
                     basis_gates=self.basis_gates,
                     optimization_level=self.optimization_level,
                     backend_properties=self.device.properties(),
+                    initial_layout=self.init_layout,
+                    seed_transpiler=self.seed_transpiler
                 )
                 return job
             except IBMQBackendJobLimitError:
@@ -322,6 +326,8 @@ class QiskitBackend(QuantumBackend):
                     )
                 circuit_index += 1
 
+            print(f"\ncount before readout correction {combined_counts}")
+
             if self.readout_correction:
                 current_circuit_from_jobs = circuit_set_from_jobs[circuit_index - 1]
                 current_circuit_from_batches = circuit_set_from_batches[
@@ -333,6 +339,8 @@ class QiskitBackend(QuantumBackend):
                 combined_counts = self._apply_readout_correction(
                     combined_counts, virtual_to_physical_qubits_dict
                 )
+
+                print(f"count after readout correction {combined_counts}\n")
 
             # qiskit counts object maps bitstrings in reversed order to ints, so we must
             # flip the bitstrings
@@ -392,13 +400,14 @@ class QiskitBackend(QuantumBackend):
                 counts[new_key] = counts.pop(key) + counts.get(new_key, 0)
 
         if not self.readout_correction_filters.get(str(physical_qubits)):
+            print("Creating readout correction filter")
 
             if self.n_samples_for_readout_calibration is None:
                 raise TypeError(
                     "n_samples_for_readout_calibration must"
                     "be set to use readout calibration"
                 )
-
+            print(f"physical qubits {physical_qubits}")
             qr = QuantumRegister(num_qubits)
             meas_cals, state_labels = complete_meas_cal(
                 qubit_list=physical_qubits, qr=qr
@@ -415,6 +424,7 @@ class QiskitBackend(QuantumBackend):
 
             # Create a measurement filter from the calibration matrix
             self.readout_correction_filters[str(physical_qubits)] = meas_fitter.filter
+            print(f"readout correction filter {self.readout_correction_filters[str(physical_qubits)]}")
 
         this_filter = self.readout_correction_filters[str(physical_qubits)]
         mitigated_counts = this_filter.apply(counts, method=self.noise_inversion_method)
@@ -422,6 +432,7 @@ class QiskitBackend(QuantumBackend):
         rounded_mitigated_counts = {
             k: round(v, 8) for k, v in mitigated_counts.items() if round(v, 8) != 0
         }
+        print(f"rounded mitigated counts {rounded_mitigated_counts}")
         return rounded_mitigated_counts
 
 
