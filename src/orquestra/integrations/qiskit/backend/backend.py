@@ -19,6 +19,7 @@ from qiskit.providers.ibmq import IBMQ
 from qiskit.providers.ibmq.exceptions import IBMQAccountError, IBMQBackendJobLimitError
 from qiskit.providers.ibmq.job import IBMQJob
 from qiskit.result import Counts
+from qiskit.test.mock import FakeJakarta
 
 from orquestra.integrations.qiskit.conversions import export_to_qiskit
 
@@ -82,6 +83,7 @@ class QiskitBackend(QuantumBackend):
         self.device = provider.get_backend(name=self.device_name)
         self.max_shots = self.device.configuration().max_shots
         self.batch_size: int = self.device.configuration().max_experiments
+        # self.device = FakeJakarta()
         self.supports_batching = True
         self.readout_correction = readout_correction
         self.readout_correction_filters: Dict[str, MeasurementFilter] = {}
@@ -95,6 +97,8 @@ class QiskitBackend(QuantumBackend):
         self.retry_timeout_seconds = retry_timeout_seconds
         self.n_samples_for_readout_calibration = n_samples_for_readout_calibration
         self.noise_inversion_method = noise_inversion_method
+
+        
 
     def run_circuit_and_measure(self, circuit: Circuit, n_samples: int) -> Measurements:
         """Run a circuit and measure a certain number of bitstrings.
@@ -167,11 +171,14 @@ class QiskitBackend(QuantumBackend):
         multiplicities = []
 
         for n_samples_for_circuit, circuit in zip(n_samples, circuitset):
-            ibmq_circuit = export_to_qiskit(circuit)
-            full_qubit_indices = list(range(circuit.n_qubits))
-            ibmq_circuit.barrier(full_qubit_indices)
-            ibmq_circuit.add_register(ClassicalRegister(size=circuit.n_qubits))
-            ibmq_circuit.measure(full_qubit_indices, full_qubit_indices)
+            if not isinstance(circuit, QuantumCircuit):
+                ibmq_circuit = export_to_qiskit(circuit)
+            elif isinstance(circuit, QuantumCircuit):
+                ibmq_circuit = circuit
+            # full_qubit_indices = list(range(circuit.n_qubits))
+            # ibmq_circuit.barrier(full_qubit_indices)
+            # ibmq_circuit.add_register(ClassicalRegister(size=circuit.n_qubits))
+            # ibmq_circuit.measure(full_qubit_indices, full_qubit_indices)
 
             multiplicities.append(math.ceil(n_samples_for_circuit / self.max_shots))
 
@@ -263,15 +270,21 @@ class QiskitBackend(QuantumBackend):
         start_time = time.time()
         while True:
             try:
-                job = execute(
+                # job = execute(
+                #     batch,
+                #     self.device,
+                #     shots=n_samples,
+                #     basis_gates=self.basis_gates,
+                #     optimization_level=self.optimization_level,
+                #     backend_properties=self.device.properties(),
+                #     initial_layout=self.init_layout,
+                #     seed_transpiler=self.seed_transpiler,
+                #     scheduling_method='alap'
+                # )
+
+                job = self.device.run(
                     batch,
-                    self.device,
                     shots=n_samples,
-                    basis_gates=self.basis_gates,
-                    optimization_level=self.optimization_level,
-                    backend_properties=self.device.properties(),
-                    initial_layout=self.init_layout,
-                    seed_transpiler=self.seed_transpiler
                 )
                 return job
             except IBMQBackendJobLimitError:
@@ -311,11 +324,13 @@ class QiskitBackend(QuantumBackend):
         circuit_counts_set = []
         for job, batch in zip(jobs, batches):
             circuit_set_from_jobs.extend(job.circuits())
+            # circuit_set_from_jobs.extend(batch)
             circuit_set_from_batches.extend(batch)
             for experiment in batch:
                 circuit_counts_set.append(job.result().get_counts(experiment))
 
         measurements_set = []
+        measurements_set_wo_re_corr = []
         circuit_index = 0
         for multiplicity in multiplicities:
             combined_counts = Counts({})
@@ -326,7 +341,7 @@ class QiskitBackend(QuantumBackend):
                     )
                 circuit_index += 1
 
-            print(f"\ncount before readout correction {combined_counts}")
+            combined_counts_copy = deepcopy(combined_counts)
 
             if self.readout_correction:
                 current_circuit_from_jobs = circuit_set_from_jobs[circuit_index - 1]
@@ -340,8 +355,6 @@ class QiskitBackend(QuantumBackend):
                     combined_counts, virtual_to_physical_qubits_dict
                 )
 
-                print(f"count after readout correction {combined_counts}\n")
-
             # qiskit counts object maps bitstrings in reversed order to ints, so we must
             # flip the bitstrings
             reversed_counts = {}
@@ -351,7 +364,15 @@ class QiskitBackend(QuantumBackend):
             measurements = Measurements.from_counts(reversed_counts)
             measurements_set.append(measurements)
 
-        return measurements_set
+            ##
+            reversed_counts = {}
+            for bitstring in combined_counts_copy.keys():
+                reversed_counts[bitstring[::-1]] = int(combined_counts_copy[bitstring])
+
+            measurements = Measurements.from_counts(reversed_counts)
+            measurements_set_wo_re_corr.append(measurements)
+
+        return measurements_set_wo_re_corr, measurements_set
 
     def _apply_readout_correction(
         self,
@@ -391,6 +412,7 @@ class QiskitBackend(QuantumBackend):
         else:
             virtual_qubits = list(virtual_to_physical_qubits_dict.keys())
             virtual_qubits.sort()
+            
             physical_qubits = [
                 virtual_to_physical_qubits_dict[virtual_qubit]
                 for virtual_qubit in virtual_qubits
@@ -400,14 +422,13 @@ class QiskitBackend(QuantumBackend):
                 counts[new_key] = counts.pop(key) + counts.get(new_key, 0)
 
         if not self.readout_correction_filters.get(str(physical_qubits)):
-            print("Creating readout correction filter")
 
             if self.n_samples_for_readout_calibration is None:
                 raise TypeError(
                     "n_samples_for_readout_calibration must"
                     "be set to use readout calibration"
                 )
-            print(f"physical qubits {physical_qubits}")
+            
             qr = QuantumRegister(num_qubits)
             meas_cals, state_labels = complete_meas_cal(
                 qubit_list=physical_qubits, qr=qr
@@ -424,7 +445,6 @@ class QiskitBackend(QuantumBackend):
 
             # Create a measurement filter from the calibration matrix
             self.readout_correction_filters[str(physical_qubits)] = meas_fitter.filter
-            print(f"readout correction filter {self.readout_correction_filters[str(physical_qubits)]}")
 
         this_filter = self.readout_correction_filters[str(physical_qubits)]
         mitigated_counts = this_filter.apply(counts, method=self.noise_inversion_method)
@@ -432,7 +452,6 @@ class QiskitBackend(QuantumBackend):
         rounded_mitigated_counts = {
             k: round(v, 8) for k, v in mitigated_counts.items() if round(v, 8) != 0
         }
-        print(f"rounded mitigated counts {rounded_mitigated_counts}")
         return rounded_mitigated_counts
 
 
@@ -547,7 +566,9 @@ def _get_virtual_to_physical_qubits_dict(
     active_virtual_qubits = _get_active_qubits(
         original_circuit
     )  # we only use the active qubits for readout correction
-    clbits_to_virtual_qubits = _get_clbit_qubit_map(original_circuit)
+    active_virtual_qubits = [0,1,2] # new-line remove
+    # clbits_to_virtual_qubits = _get_clbit_qubit_map(original_circuit)
+    clbits_to_virtual_qubits = [0,1,2] # new-line remove
     clbits_to_physical_qubits = _get_clbit_qubit_map(transpiled_circuit)
 
     assert len(clbits_to_virtual_qubits) == len(clbits_to_physical_qubits)
